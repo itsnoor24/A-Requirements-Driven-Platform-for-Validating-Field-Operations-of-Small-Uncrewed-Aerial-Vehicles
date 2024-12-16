@@ -1,98 +1,127 @@
-from time import sleep
-from time import time
+import time
 import numpy as np
-from PythonClient.multirotor.monitor.abstract.globa_monitor import GlobalMonitor
+from drone_monitor_base import GlobalMonitor  # simplified import
 
 
-class MinSepDistMonitor(GlobalMonitor):
-    def __init__(self, horizontal=1, lateral=0):
+class DroneDistanceMonitor(GlobalMonitor):
+    """
+    My custom monitor to check if drones are keeping safe distances from each other
+    """
+
+    def __init__(self, min_horizontal_dist=1, min_vertical_dist=0):
         super().__init__()
-        self.violation_flag = False
-        self.run = True
-        self.lateral_distances = []
-        self.horizontal_distance = []
-        self.drone_name_table = []
-        self.drone_number = len(self.all_drone_names)
-        self.min_lateral_separation_distance = lateral
-        self.min_horizontal_separation_distance = horizontal
+        # Basic settings
+        self.is_running = True
+        self.had_violation = False
+        self.update_interval = 1  # seconds between checks
+
+        # Distance requirements
+        self.min_horizontal_dist = min_horizontal_dist
+        self.min_vertical_dist = min_vertical_dist
+
+        # Tracking data
+        self.drone_list = []
+        self.num_drones = len(self.all_drone_names)
+        self.start_timestamp = None
+
+        # Arrays for distance calculations
+        self.vertical_distances = []
+        self.horizontal_distances = []
         self.drone_positions = []
-        self.start_time = None
-        self.dt = 1
 
-    def start(self):
-        self.append_info_to_log(f"{self.all_drone_names}"
-                                f";MinSepDistMonitor started, "
-                                f"checking breach of lateral: {self.min_lateral_separation_distance} meters, "
-                                f"horizontal : {self.min_horizontal_separation_distance} meters, "
-                                f"for every {self.dt} seconds")
-        self.start_time = time()
-        self.create_drone_name_list()
-        while self.run:
-            self.drone_positions = self.get_drone_positions()
-            self.horizontal_distance = self.get_horizontal_distance()
-            self.lateral_distances = self.get_lateral_distance()
-            self.check_breaches()
-            sleep(self.dt)
-        if self.violation_flag:
-            self.append_fail_to_log(f"{self.all_drone_names};The minimum separation distance was breached")
+    def start_monitoring(self):
+        # Log monitor startup
+        msg = (
+            f"Starting distance monitor for drones: {self.all_drone_names}\n"
+            f"Minimum distances: {self.min_horizontal_dist}m horizontal, "
+            f"{self.min_vertical_dist}m vertical\n"
+            f"Checking every {self.update_interval} seconds"
+        )
+        self.log_info(msg)
+
+        # Setup
+        self.start_timestamp = time.time()
+        self._setup_drone_list()
+
+        # Main monitoring loop
+        while self.is_running:
+            self._update_distances()
+            self._check_distance_violations()
+            time.sleep(self.update_interval)
+
+        # Final report
+        self._create_final_report()
+
+    def stop_monitoring(self):
+        self.is_running = False
+
+    def _setup_drone_list(self):
+        self.drone_list = [name for name in self.all_drone_names]
+
+    def _update_distances(self):
+        # Get current positions of all drones
+        self.drone_positions = [
+            self.client.simGetObjectPose(drone).position
+            for drone in self.all_drone_names
+        ]
+
+        # Calculate distances between all drones
+        self._calc_horizontal_distances()
+        self._calc_vertical_distances()
+
+    def _calc_horizontal_distances(self):
+        distances = []
+        for i in range(self.num_drones):
+            row = []
+            for j in range(self.num_drones):
+                dx = self.drone_positions[i].x_val - self.drone_positions[j].x_val
+                dy = self.drone_positions[i].y_val - self.drone_positions[j].y_val
+                dist = np.sqrt(dx**2 + dy**2)
+                row.append(dist)
+            distances.append(row)
+        self.horizontal_distances = np.array(distances)
+
+    def _calc_vertical_distances(self):
+        distances = []
+        for i in range(self.num_drones):
+            row = []
+            for j in range(self.num_drones):
+                dist = abs(
+                    self.drone_positions[i].z_val - self.drone_positions[j].z_val
+                )
+                row.append(dist)
+            distances.append(row)
+        self.vertical_distances = np.array(distances)
+
+    def _check_distance_violations(self):
+        if self.min_horizontal_dist > 0:
+            self._check_horizontal_violations()
+
+    def _check_horizontal_violations(self):
+        violations = np.where(self.horizontal_distances < self.min_horizontal_dist)
+
+        for i in range(len(violations[0])):
+            drone1_idx = violations[0][i]
+            drone2_idx = violations[1][i]
+
+            # Skip self-comparisons
+            if drone1_idx != drone2_idx:
+                self.had_violation = True
+                current_time = round(time.time() - self.start_timestamp)
+                current_dist = round(
+                    self.horizontal_distances[drone1_idx][drone2_idx], 2
+                )
+
+                msg = (
+                    f"Distance violation between {self.drone_list[drone1_idx]} and "
+                    f"{self.drone_list[drone2_idx]} at {current_time}s - "
+                    f"Distance: {current_dist}m"
+                )
+                self.log_error(msg)
+
+    def _create_final_report(self):
+        if self.had_violation:
+            self.log_error("Mission completed - Distance violations detected")
         else:
-            self.append_pass_to_log(f"{self.all_drone_names};The minimum separation distance was not breached")
+            self.log_info("Mission completed - All distances maintained")
         self.save_report()
-
-    def stop(self):
-        self.run = False
-
-    def get_drone_positions(self):
-        return [self.client.simGetObjectPose(i).position for i in self.all_drone_names]
-
-    def get_horizontal_distance(self):
-        # Create a matrix of horizontal distances between all the drones and the target drone named
-        return np.array([[((self.drone_positions[i].x_val - self.drone_positions[j].x_val) ** 2 +
-                           (self.drone_positions[i].y_val - self.drone_positions[j].y_val) ** 2) ** 0.5 for j in
-                          range(self.drone_number)] for i in range(self.drone_number)])
-
-    def get_lateral_distance(self):
-        # Create a matrix of lateral distances between all the drones
-        return np.array(
-            [[abs(self.drone_positions[i].z_val - self.drone_positions[j].z_val) for j in range(self.drone_number)] for
-             i in range(self.drone_number)])
-
-    def check_breaches(self):
-        # Check if any horizontal distance is less than the minimum horizontal separation distance
-        if self.min_horizontal_separation_distance > 0 and np.any(
-                self.horizontal_distance < self.min_horizontal_separation_distance):
-            # Get the indices of drones that are breaching the minimum horizontal separation distance
-            breaching_indices = np.where(self.horizontal_distance < self.min_horizontal_separation_distance)
-            # print("Drones breaching the minimum horizontal separation distance:")
-            for i in range(len(breaching_indices[0])):
-                # skip when comparing with itself
-                if breaching_indices[0][i] + 1 != breaching_indices[1][i] + 1:
-                    self.violation_flag = True
-                    self.append_fail_to_log(
-                        f"{self.drone_name_table[breaching_indices[0][i]]} and "
-                        f"{self.drone_name_table[breaching_indices[1][i]]};"
-                        f"Horizontal breach at {round(time()-self.start_time)} seconds in the mission: "
-                        f"current horizontal distance: "
-                        f"{round(self.horizontal_distance[breaching_indices[0][i]][breaching_indices[1][i]],2)} meters")
-            # take appropriate action
-        # Check if any lateral distance is less than the minimum lateral separation distance
-        # if self.min_lateral_separation_distance > 0 and np.any(
-        #         self.lateral_distances < self.min_lateral_separation_distance):
-        #     # Get the indices of drones that are breaching the minimum lateral separation distance
-        #     breaching_indices = np.where(self.lateral_distances < self.min_lateral_separation_distance)
-        #
-        #     for i in range(len(breaching_indices[0])):
-        #         if breaching_indices[0][i] + 1 != breaching_indices[1][i] + 1:
-        #             self.violation_flag = True
-        #             self.append_fail_to_log(
-        #                 f"{self.current_time_string}: "
-        #                 f"{self.drone_name_table[breaching_indices[0][i]]} and "
-        #                 f"{self.drone_name_table[breaching_indices[1][i]]}; Lateral breach: "
-        #                 f"current lateral distance: { round(self.lateral_distances[breaching_indices[0][i]][breaching_indices[1][i]],2)} meters")
-            # take appropriate action
-        # else:
-        #     print("Drones are not breaching the minimum separation distance.")
-
-    def create_drone_name_list(self):
-        for i in self.all_drone_names:
-            self.drone_name_table.append(i)
